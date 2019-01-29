@@ -1,0 +1,230 @@
+version: '2.0'
+
+serviceMoveToLag:
+  description: 'move services from port to lag'
+  type: direct
+
+
+  tags:
+    - Mark P Please Do Not Delete
+
+  script_out: <% $.scriptOut %>
+  input:
+    - token_auth
+    - rest_gateway_host
+    - nfmp_host
+    - lagId
+    - lagDescr
+    - servicePort
+    - targetNode
+    - newPorts
+
+  tasks:
+    run_get_token:
+      action: nsp.access.token rest_gateway_host='<% $.rest_gateway_host %>' token_auth='<% $.token_auth %>'
+      publish:
+        token: <% task().result %>
+      on-success:
+        - checkLag
+        
+    checkLag:
+      action: std.http
+      input:
+        url: 'https://<% $.nfmp_host %>:8443/nfm-p/rest/api/v1/managedobjects/network:<% $.targetNode %>:lag:interface-<% $.lagId %>'
+        method: GET
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+      on-success:
+        - copySaps
+      on-error:
+        - createLag
+        
+      publish:
+        checkLagResult: <% task().result.content%>     
+    
+
+    createLag:
+      action: std.http
+      input:
+        url: 'https://<% $.nfmp_host %>:8443/nfm-p/rest/api/v1/managedobjects'
+        method: POST
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+        body: |
+          {"fdn": "network:<% $.targetNode %>:lag","configInfo": {"fullClassName": "lag.Interface","properties": {"lagId": "<% $.lagId %>","description": "<% $.lagDescr %>","mode": "access",
+            "encapType": "qinqEncap","administrativeState": "portInService","portThreshold": "1","portThresholdAction": "dynamicCost","dynamicCosting": "true","adaptQoS": "link"}}}
+      on-success:
+        - copySaps
+      on-error:
+        - actionFailed
+        
+      publish:
+        lagFdn: <% task().result.content.objectFullName %> 
+        
+    copySaps:
+      action: std.http
+      input:
+        url: 'https://<% $.nfmp_host %>:8443/xmlapi/invoke'
+        method: POST
+        verify: False
+        headers:
+          Content-Type: 'text/xml'
+        body: |
+         <SOAP:Envelope xmlns:SOAP="http://schemas.xmlsoap.org/soap/envelope/">
+         <SOAP:Header>
+         <header xmlns="xmlapi_1.0">
+         <security>
+         <user>SamOClient</user>
+         <password hashed="false">5620Sam!</password>
+         </security>
+         <requestID>wfm1</requestID>
+          </header>
+         </SOAP:Header>
+            <SOAP:Body>
+            <service.L2AccessInterface.copyMoveSaps xmlns="xmlapi_1.0">
+            <deployer>immediate</deployer>
+            <copyMoveStruct>
+            <service.SapCopyMoveStruct>
+            <sourcePortFdn><% $.servicePort %></sourcePortFdn>
+            <isMoving>true</isMoving>
+            <outerEncapShiftOffset>0</outerEncapShiftOffset>
+               <innerEncapShiftOffset>0</innerEncapShiftOffset>
+            <targetType>1</targetType>
+            <destinationPortFdn>network:<% $.targetNode %>:lag:interface-<% $.lagId %></destinationPortFdn>
+            </service.SapCopyMoveStruct>
+            </copyMoveStruct>
+            </service.L2AccessInterface.copyMoveSaps>
+            </SOAP:Body>
+            </SOAP:Envelope>  
+      on-success:
+        - addPortsToLag
+      on-error:
+        - actionFailed        
+      publish:
+        copySapsResult: <% task().result.content %>
+        
+    addPortsToLag:
+      with-items: items in <% $.newPorts %>
+      action: std.http
+      input:
+        url: 'https://<% $.nfmp_host %>:8443/nfm-p/rest/api/v1/managedobjects'
+        method: POST
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+        body: |
+          {"fdn": "network:<% $.targetNode %>:lag:interface-<% $.lagId %>","configInfo": {"fullClassName": "lag.PortTermination","properties": {"portPointer": "<% $.items.port %>","priority": "32768","memberName": "<% $.items.member %>","subGroupId": "1"}}}
+      on-success:
+        - getServiceSaps      
+      publish:
+        addToLagResult: <% task().result.content %>
+
+    getServiceSaps:
+      action: std.http
+      input:
+        url: 'https://<% $.nfmp_host %>:8443/nfm-p/rest/api/v1/managedobjects/searchWithFilter'
+        method: POST
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+        body: |
+          {"fullClassName": "service.AccessInterface",
+          "resultFilter":["serviceName","svcComponentId"],
+          "filterExpression": "portPointer = 'network:<% $.targetNode %>:lag:interface-<% $.lagId %>'"}
+      publish:
+        serviceName: <% task().result.content.serviceName %>
+      on-success:
+        - getService    
+      on-error:
+        - revoke_token 
+        
+    getService:
+      action: std.http
+      input:
+        url: 'https://<% $.nfmp_host %>:8443/nfm-p/rest/api/v1/managedobjects/searchWithFilter'
+        method: POST
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+        body: |
+          {"fullClassName": "service.Service",
+          "resultFilter":["displayedName","serviceId","objectFullName"],
+          "filterExpression": "displayedName = '<% $.serviceName[0] %>'"}
+      publish:
+        svcMgrFdn: <% task().result.content.objectFullName %>
+      on-success:
+        - encodeTheUrl    
+      on-error:
+        - revoke_token 
+        
+    encodeTheUrl:
+      action: std.javascript
+      input:
+        script: |
+          
+          function repl() {
+          var str = "<% $.svcMgrFdn[0] %>";
+          var res = encodeURIComponent(str);
+          return res;
+          }
+          return repl();
+
+      publish:
+        encodedUrl: <% task(encodeTheUrl).result %>
+      on-complete:
+        - triggerTest
+      on-error:
+        - revoke_token
+        
+    triggerTest:
+      action: std.http
+      input:
+        url: 'https://<% $.nfmp_host %>:8543/ServiceSupervision/rest/api/v1/oam/ethernetCfm/services/<% $.encodedUrl %>/oneTimeTest'
+        method: POST
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+        body: |
+          {"oamTestType": "CFM Two Way Delay","cfmTestLevel": "Level 0","numProbes": 1}
+
+      publish:
+        testResultLoc: <% task().result.content.testResults %>
+      on-success:
+        - getTestResults    
+      on-error:
+        - revoke_token
+
+    getTestResults:
+      action: std.http
+      wait-before: 20
+      input:
+        url: '<% $.testResultLoc %>'
+        method: GET
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+
+      publish:
+        testResultDetails: <% task().result.content %>
+      on-success:
+        - revoke_token    
+      on-error:
+        - revoke_token  
+
+    revoke_token:
+      action: nsp.revoke.token rest_gateway_host='<% $.rest_gateway_host %>' token_auth='<% $.token_auth %>' token='<% $.token %>'
+      publish:
+        result: <% task().result %>
+
+        
+    actionFailed:
+      action: std.fail
