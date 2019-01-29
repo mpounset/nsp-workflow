@@ -1,0 +1,115 @@
+version: '2.0'
+
+oam_1731_Test:
+  description: 'apply test to service'
+  type: direct
+
+
+  tags:
+    - NSD
+    - ServiceFulfillment
+    - KafkaTrigger
+
+  script_out: <% $.scriptOut %>
+  input:
+    - token_auth
+    - rest_gateway_host
+    - serviceName
+    - nfmp_host
+
+  tasks:
+    run_get_token:
+      action: nsp.access.token rest_gateway_host='<% $.rest_gateway_host %>' token_auth='<% $.token_auth %>'
+      publish:
+        token: <% task().result %>
+      on-success:
+        - getService
+
+    getService:
+      action: std.http
+      input:
+        url: 'https://<% $.nfmp_host %>:8443/nfm-p/rest/api/v1/managedobjects/searchWithFilter'
+        method: POST
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+        body: |
+          {"fullClassName": "service.Service",
+          "resultFilter":["displayedName","serviceId","objectFullName"],
+          "filterExpression": "displayedName = '<% $.serviceName %>'"}
+      publish:
+        svcMgrFdn: <% task().result.content.objectFullName %>
+      on-success:
+        - encodeTheUrl    
+      on-error:
+        - actionFailed
+        - revoke_token 
+        
+    encodeTheUrl:
+      action: std.javascript
+      input:
+        script: |
+          
+          function repl() {
+          var str = "<% $.svcMgrFdn[0] %>";
+          var res = encodeURIComponent(str);
+          return res;
+          }
+          return repl();
+
+      publish:
+        encodedUrl: <% task(encodeTheUrl).result %>
+      on-success:
+        - triggerTest
+      on-error:
+        - revoke_token
+        - actionFailed
+
+    triggerTest:
+      action: std.http
+      input:
+        url: 'https://<% $.rest_gateway_host %>:8544/ServiceSupervision/rest/api/v1/oam/ethernetCfm/services/<% $.encodedUrl %>/oneTimeTest'
+        method: POST
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+        body: |
+          {"oamTestType": "CFM Two Way Delay","cfmTestLevel": "Level 0","numProbes": 1}
+
+      publish:
+        testResultLoc: <% task().result.content.testResults %>
+      on-success:
+        - getTestResults    
+      on-error:
+        - actionFailed
+        - revoke_token
+
+    getTestResults:
+      action: std.http
+      wait-before: 20
+      input:
+        url: '<% $.testResultLoc %>'
+        method: GET
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+
+      publish:
+        testResultDetails: <% task().result.content %>
+      on-success:
+        - revoke_token    
+      on-error:
+        - actionFailed
+        - revoke_token  
+        
+    revoke_token:
+      action: nsp.revoke.token rest_gateway_host='<% $.rest_gateway_host %>' token_auth='<% $.token_auth %>' token='<% $.token %>'
+      publish:
+        result: <% task().result %>
+
+
+    actionFailed:
+      action: std.fail
