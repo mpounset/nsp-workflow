@@ -1,0 +1,326 @@
+version: '2.0'
+
+nodeIntoMaint:
+  type: direct
+  
+  workflow_meta:
+    title: 'Automate Maint Mode On Node Links'
+    author: 'NOKIA NMS'
+    version: '1.1.1'
+    licence: 'MIT'
+    published: '2019-04-16 10:00:00 BST'
+    description: ' Automates putting all links to>from node into maint mode and re-signal affected LSPs'
+    depreceated: false
+    engine:
+      wfm: '>=2.0'
+      nspOs: ['19.3']
+      nfmp: []
+    urls:
+      homeage: 'https://github.com/nokia/nsp-workflow/tree/master/unsupported/wfm/nodeIntoMaint'
+      repository: 'https://github.com/nokia/nsp-workflow'
+      bugs: 'https://github.com/nokia/nsp-workflow/issues'
+      
+  tags:
+    - DO NOT RUN
+    - Nokia WFM Blueprint
+
+  input:
+    - token_auth : ''
+    - rest_gateway_host : ''
+    - targetNode : ''
+    - status : 'MAINTENANCE'
+    - mode: 'auto'
+
+    
+  tasks:
+        
+    run_get_token:
+      action: nsp.access.token rest_gateway_host='<% $.rest_gateway_host %>' token_auth='<% $.token_auth %>'
+      publish:
+        token: <% task().result %>
+      on-success:
+        - get_node_list
+ 
+        
+    get_node_list:
+      action: std.http
+      input:
+        url: 'https://<% $.rest_gateway_host %>:8543/sdn/api/v4/nsp/net/l3/networks'
+        method: GET
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'    
+      publish:
+        nodeData:  <% task().result %>
+      on-success:
+        - map_json_task
+      on-error:
+        - revoke_token
+        
+    map_json_task:
+      action: std.javascript
+      input:
+        context: <% $ %>
+        script: |
+          function objectToPaths(data) {
+           var validId = /^[a-z_$][a-z0-9_$]*$/i;
+           var result = new Map();
+           doIt(data, "");
+           return result;
+
+           function doIt(data, s) {
+            if (data && typeof data === "object") {
+             if (Array.isArray(data)) {
+              for (var i = 0; i < data.length; i++) {
+               doIt(data[i], s + "[" + i + "]");
+              }
+             } else {
+              for (var p in data) {
+               if (validId.test(p)) {
+                doIt(data[p], s + "." + p);
+               } else {
+                //doIt(data[p], s + "[\"" + p + "\"]");
+                doIt(data[p], s + "[" + p + "]");
+               }
+              }
+             }
+            } else {
+             result.set(s, data);
+            }
+           }
+          }
+
+          var dataStr = $.nodeData;
+          var needle1 = ".content.response.data.network\\[\\b[0-9a-fA-F]{3,}\\b-\\b[0-9a-fA-F]{8}\\b-\\b[0-9a-fA-F]{4}\\b-\\b[0-9a-fA-F]{4}\\b-\\b[0-9a-fA-F]{4}\\b-\\b[0-9a-fA-F]{12}\\b\\].node\\[\\b[0-9a-fA-F]{3}\\b-\\b[0-9a-fA-F]{8}\\b-\\b[0-9a-fA-F]{4}\\b-\\b[0-9a-fA-F]{4}\\b-\\b[0-9a-fA-F]{4}\\b-\\b[0-9a-fA-F]{12}\\b\\].nspNode.nodeState.nodeParams.nodeId.dottedQuad.string"
+          var needle2 = "<% $.targetNode %>"
+
+          var re1 = new RegExp(needle1);
+          var re2 = new RegExp(needle2);
+
+          
+          var data = objectToPaths(dataStr);
+          var result = [];
+          var nodes = [];
+          var networkUuid = "";
+
+          //get the network UUID
+          for (var [key, value] of data.entries()) {
+            if (key.match(re1)) {
+              var valTest = String(value);
+              var keyTest = String(key);
+              if (valTest.match(re2) ) {
+                var partsOfStr = keyTest.split('.');
+                var rep = partsOfStr[4].replace("network[","");
+                var rep2 = rep.replace("]","");
+                networkUuid = rep2;
+                var rep = partsOfStr[5].replace("node[","");
+                var rep2 = rep.replace("]","");
+                nodes.push(rep2);
+              }
+            }
+          }
+          //get the link UUID
+          var links = [];
+          var sourceLink = new Map();
+          var destLink = new Map();
+          var needle4 = ".content.response.data.network\\[" + networkUuid + "\\].link\\[\\b[0-9a-fA-F]{3,}\\b-\\b[0-9a-fA-F]{8}\\b-\\b[0-9a-fA-F]{4}\\b-\\b[0-9a-fA-F]{4}\\b-\\b[0-9a-fA-F]{4}\\b-\\b[0-9a-fA-F]{12}\\b\\].source.sourceNode";
+          var needle5 = ".content.response.data.network\\[" + networkUuid + "\\].link\\[\\b[0-9a-fA-F]{3,}\\b-\\b[0-9a-fA-F]{8}\\b-\\b[0-9a-fA-F]{4}\\b-\\b[0-9a-fA-F]{4}\\b-\\b[0-9a-fA-F]{4}\\b-\\b[0-9a-fA-F]{12}\\b\\].destination.destNode";
+          var re4 = new RegExp(needle4);
+          var re5 = new RegExp(needle5);
+          var re6 = new RegExp(nodes[0]);
+
+          
+          for (var [key, value] of data.entries()) {
+            var keyTest = String(key);
+            var valTest = String(value);
+            if (key.match(re4) && valTest.match(re6)) {
+              //source
+              var partsOfStr = keyTest.split('.');
+              var rep = partsOfStr[5].replace("link[","");
+              var rep2 = rep.replace("]","");
+              var linkUuid = rep2;        
+              sourceLink.set(linkUuid,linkUuid);
+            } else if (key.match(re5) && valTest.match(re6)) {
+              //destination
+              var partsOfStr = keyTest.split('.');
+              var rep = partsOfStr[5].replace("link[","");
+              var rep2 = rep.replace("]","");
+              var linkUuid = rep2;
+              destLink.set(linkUuid,linkUuid);
+            }
+          }
+          
+          for (var [key, value] of destLink.entries()) {
+           if (destLink.has(key)) {
+            links.push(key);
+           }
+          }
+          for (var [key, value] of sourceLink.entries()) {
+           if (sourceLink.has(key)) {
+            links.push(key);
+           }
+          }
+          result.push(networkUuid);
+          result.push(nodes)
+          result.push(links)
+          return result;
+      publish:
+        networkUuid: <% task(map_json_task).result[0] %>
+        nodeUuids: <% task(map_json_task).result[1] %>
+        linkUuids: <% task(map_json_task).result[2] %>
+        nodeData: null
+      on-success:
+        - maintModeExecute
+      on-error:
+        - revoke_token 
+        
+    maintModeExecute:
+      with-items: link in <% $.linkUuids %>
+      action: nsp.link.status token='<% $.token %>' rest_gateway_host='<% $.rest_gateway_host %>' status='<% $.status %>' linkId='<% $.link %>'
+      on-success:
+        - getAllOutgoingLsps : <% $.mode = 'auto' %>
+        - revoke_token : <% $.mode = 'manual' %>
+      on-error:
+        - revoke_token          
+
+    getAllOutgoingLsps:
+      wait-before: 10
+      with-items: link in <% $.linkUuids %>
+      action: std.http
+      input:
+        url: 'https://<% $.rest_gateway_host %>:8543/sdn/api/v4/mpls/lsp/paths/on-link/<% $.link %>/OUTGOING'
+        method: GET
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+      publish:
+        outLspIds: <% task(getAllOutgoingLsps).result.content.response.data.pathId %>
+      on-success:
+       - testMe 
+      on-error:
+       - revoke_token          
+       
+    testMe:
+      action: std.noop
+      publish:
+        lspPathList: <% $.outLspIds.selectMany($) %>
+      on-success:
+        - optimiseOutPaths    
+      on-error:
+       - revoke_token 
+               
+    optimiseOutPaths:
+      action: std.http
+      input:
+        url: 'https://<% $.rest_gateway_host %>:8543/sdn/api/v4/mpls/resignal'
+        method: POST
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+        body:
+          data: <% $.lspPathList %>
+      publish:
+        optimiseResult: <% task(optimiseOutPaths).result %>
+      on-success:
+       - getAllIncomingLsps 
+      on-error:
+       - revoke_token  
+
+    getAllIncomingLsps:
+      with-items: link in <% $.linkUuids %>
+      action: std.http
+      input:
+        url: 'https://<% $.rest_gateway_host %>:8543/sdn/api/v4/mpls/lsp/paths/on-link/<% $.link %>/INCOMING'
+        method: GET
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+      publish:
+        inLspIds: <% task(getAllIncomingLsps).result.content.response.data.pathId %>
+      on-success:
+       - testMe3 
+      on-error:
+       - revoke_token          
+       
+    testMe3:
+      action: std.noop
+      publish:
+        inlspPathList: <% $.inLspIds.selectMany($) %>
+      on-success:
+        - optimiseInPaths    
+      on-error:
+       - revoke_token 
+       
+
+    optimiseInPaths:
+      action: std.http
+      input:
+        url: 'https://<% $.rest_gateway_host %>:8543/sdn/api/v4/mpls/resignal'
+        method: POST
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+        body:
+          data: <% $.inlspPathList %>
+      publish:
+        optimiseInResult: <% task(optimiseInPaths).result %>
+      on-success:
+       - getAllMovedLsps 
+      on-error:
+       - revoke_token  
+       
+    getAllMovedLsps:
+      with-items: link in <% $.linkUuids %>
+      action: std.http
+      input:
+        url: 'https://<% $.rest_gateway_host %>:8543/sdn/api/v4/mpls/lsp/paths/on-link/<% $.link %>/MOVED'
+        method: GET
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+      publish:
+        movedLspIds: <% task(getAllMovedLsps).result.content.response.data.pathId %>
+      on-success:
+       - testMe4 
+      on-error:
+       - revoke_token          
+       
+    testMe4:
+      action: std.noop
+      publish:
+        movedlspPathList: <% $.movedLspIds.selectMany($) %>
+      on-success:
+        - optimiseMovedPaths    
+      on-error:
+       - revoke_token 
+       
+
+    optimiseMovedPaths:
+      action: std.http
+      input:
+        url: 'https://<% $.rest_gateway_host %>:8543/sdn/api/v4/mpls/resignal'
+        method: POST
+        verify: False
+        headers:
+          Content-Type: 'application/json'
+          Authorization: 'Bearer <% $.token %>'
+        body:
+          data: <% $.movedlspPathList %>
+      publish:
+        optimiseMovedResult: <% task(optimiseMovedPaths).result %>
+      on-success:
+       - revoke_token 
+      on-error:
+       - revoke_token        
+                 
+          
+    revoke_token:
+      action: nsp.revoke.token rest_gateway_host='<% $.rest_gateway_host %>' token_auth='<% $.token_auth %>' token='<% $.token %>'
+      publish:
+        result: <% task().result %>
